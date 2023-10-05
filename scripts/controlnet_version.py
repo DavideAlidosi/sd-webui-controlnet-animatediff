@@ -1,4 +1,4 @@
-version_flag = 'v1.1.410 AnimateDiff'
+version_flag = 'v1.1.410 for AnimateDiff'
 
 from scripts.logging import logger
 
