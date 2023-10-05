@@ -7,6 +7,9 @@
         '📝': 'Open new canvas',
         '📷': 'Enable webcam',
         '⇄': 'Mirror webcam',
+        '💾': 'Save preset',
+        '🗑️': 'Delete preset',
+        '↩': 'Reset preset',
     };
 
     onUiUpdate(function () {

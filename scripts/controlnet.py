@@ -1,26 +1,30 @@
 import gc
 import os
 import logging
+import re
 from collections import OrderedDict
 from copy import copy
 from typing import Dict, Optional, Tuple
 import modules.scripts as scripts
 from modules import shared, devices, script_callbacks, processing, masking, images
 import gradio as gr
+import time
 
 
 from einops import rearrange
 from scripts import global_state, hook, external_code, processor, batch_hijack, controlnet_version, utils
-from scripts.controlnet_ui import controlnet_ui_group
-from scripts.cldm import PlugableControlModel
+from scripts.controlnet_lora import bind_control_lora, unbind_control_lora
 from scripts.processor import *
-from scripts.adapter import PlugableAdapter
+from scripts.adapter import Adapter, StyleAdapter, Adapter_light
+from scripts.controlnet_lllite import PlugableControlLLLite, clear_all_lllite
+from scripts.controlmodel_ipadapter import PlugableIPAdapter, clear_all_ip_adapter
 from scripts.utils import load_state_dict, get_unique_axis0
-from scripts.hook import ControlParams, UnetHook, ControlModelType
+from scripts.hook import ControlParams, UnetHook, ControlModelType, HackedImageRNG
 from scripts.controlnet_ui.controlnet_ui_group import ControlNetUiGroup, UiControlNetUnit
 from scripts.logging import logger
 from modules.processing import StableDiffusionProcessingImg2Img, StableDiffusionProcessingTxt2Img
 from modules.images import save_image
+from scripts.infotext import Infotext
 
 import cv2
 import numpy as np
@@ -30,6 +34,8 @@ from pathlib import Path
 from PIL import Image, ImageFilter, ImageOps
 from scripts.lvminthin import lvmin_thin, nake_nms
 from scripts.processor import model_free_preprocessors
+from scripts.controlnet_model_guess import build_model_by_guess
+
 
 gradio_compat = True
 try:
@@ -45,6 +51,11 @@ except ImportError:
 import tempfile
 gradio_tempfile_path = os.path.join(tempfile.gettempdir(), 'gradio')
 os.makedirs(gradio_tempfile_path, exist_ok=True)
+
+
+def clear_all_secondary_control_models():
+    clear_all_lllite()
+    clear_all_ip_adapter()
 
 
 def find_closest_lora_model_name(search: str):
@@ -226,6 +237,7 @@ class Script(scripts.Script, metaclass=(
         self.enabled_units = []
         self.detected_map = []
         self.post_processors = []
+        self.noise_modifier = None
         batch_hijack.instance.process_batch_callbacks.append(self.batch_tab_process)
         batch_hijack.instance.process_batch_each_callbacks.append(self.batch_tab_process_each)
         batch_hijack.instance.postprocess_batch_each_callbacks.insert(0, self.batch_tab_postprocess_each)
@@ -246,26 +258,25 @@ class Script(scripts.Script, metaclass=(
             model="None"
         )
 
-    def uigroup(self, tabname: str, is_img2img: bool, elem_id_tabname: str):
+    def uigroup(self, tabname: str, is_img2img: bool, elem_id_tabname: str) -> Tuple[ControlNetUiGroup, gr.State]:
         group = ControlNetUiGroup(
             gradio_compat,
-            self.infotext_fields,
             Script.get_default_ui_unit(),
             self.preprocessor,
         )
-        group.render(tabname, elem_id_tabname)
+        group.render(tabname, elem_id_tabname, is_img2img)
         group.register_callbacks(is_img2img)
-        return group.render_and_register_unit(tabname, is_img2img)
+        return group, group.render_and_register_unit(tabname, is_img2img)
 
     def ui(self, is_img2img):
         """this function should create gradio UI elements. See https://gradio.app/docs/#components
         The return value should be an array of all components that are used in processing.
         Values of those returned components will be passed to run() and process() functions.
         """
-        self.infotext_fields = []
-        self.paste_field_names = []
+        infotext = Infotext()
+        
         controls = ()
-        max_models = shared.opts.data.get("control_net_max_models_num", 1)
+        max_models = shared.opts.data.get("control_net_unit_count", 3)
         elem_id_tabname = ("img2img" if is_img2img else "txt2img") + "_controlnet"
         with gr.Group(elem_id=elem_id_tabname):
             with gr.Accordion(f"ControlNet {controlnet_version.version_flag}", open = False, elem_id="controlnet"):
@@ -274,14 +285,18 @@ class Script(scripts.Script, metaclass=(
                         for i in range(max_models):
                             with gr.Tab(f"ControlNet Unit {i}", 
                                         elem_classes=['cnet-unit-tab']):
-                                controls += (self.uigroup(f"ControlNet-{i}", is_img2img, elem_id_tabname),)
+                                group, state = self.uigroup(f"ControlNet-{i}", is_img2img, elem_id_tabname)
+                                infotext.register_unit(i, group)
+                                controls += (state,)
                 else:
                     with gr.Column():
-                        controls += (self.uigroup(f"ControlNet", is_img2img, elem_id_tabname),)
+                        group, state = self.uigroup(f"ControlNet", is_img2img, elem_id_tabname)
+                        infotext.register_unit(0, group)
+                        controls += (state,)
 
-        if shared.opts.data.get("control_net_sync_field_args", False):
-            for _, field_name in self.infotext_fields:
-                self.paste_field_names.append(field_name)
+        if shared.opts.data.get("control_net_sync_field_args", True):
+            self.infotext_fields = infotext.infotext_fields
+            self.paste_field_names = infotext.paste_field_names
 
         return controls
     
@@ -292,7 +307,7 @@ class Script(scripts.Script, metaclass=(
         devices.torch_gc()
 
     @staticmethod
-    def load_control_model(p, unet, model, lowvram):
+    def load_control_model(p, unet, model):
         if model in Script.model_cache:
             logger.info(f"Loading model from cache: {model}")
             return Script.model_cache[model]
@@ -303,7 +318,7 @@ class Script(scripts.Script, metaclass=(
             gc.collect()
             devices.torch_gc()
 
-        model_net = Script.build_control_model(p, unet, model, lowvram)
+        model_net = Script.build_control_model(p, unet, model)
 
         if shared.opts.data.get("control_net_model_cache_size", 2) > 0:
             Script.model_cache[model] = model_net
@@ -311,7 +326,7 @@ class Script(scripts.Script, metaclass=(
         return model_net
 
     @staticmethod
-    def build_control_model(p, unet, model, lowvram):
+    def build_control_model(p, unet, model):
         if model is None or model == 'None':
             raise RuntimeError(f"You have not selected any ControlNet Model.")
 
@@ -332,67 +347,8 @@ class Script(scripts.Script, metaclass=(
 
         logger.info(f"Loading model: {model}")
         state_dict = load_state_dict(model_path)
-        network_module = PlugableControlModel
-        network_config = shared.opts.data.get("control_net_model_config", global_state.default_conf)
-        if not os.path.isabs(network_config):
-            network_config = os.path.join(global_state.script_dir, network_config)
-
-        if any([k.startswith("body.") or k == 'style_embedding' for k, v in state_dict.items()]):
-            # adapter model
-            network_module = PlugableAdapter
-            network_config = shared.opts.data.get("control_net_model_adapter_config", global_state.default_conf_adapter)
-            if not os.path.isabs(network_config):
-                network_config = os.path.join(global_state.script_dir, network_config)
-
-        model_path = os.path.abspath(model_path)
-        model_stem = Path(model_path).stem
-        model_dir_name = os.path.dirname(model_path)
-
-        possible_config_filenames = [
-            os.path.join(model_dir_name, model_stem + ".yaml"),
-            os.path.join(global_state.script_dir, 'models', model_stem + ".yaml"),
-            os.path.join(model_dir_name, model_stem.replace('_fp16', '') + ".yaml"),
-            os.path.join(global_state.script_dir, 'models', model_stem.replace('_fp16', '') + ".yaml"),
-            os.path.join(model_dir_name, model_stem.replace('_diff', '') + ".yaml"),
-            os.path.join(global_state.script_dir, 'models', model_stem.replace('_diff', '') + ".yaml"),
-            os.path.join(model_dir_name, model_stem.replace('-fp16', '') + ".yaml"),
-            os.path.join(global_state.script_dir, 'models', model_stem.replace('-fp16', '') + ".yaml"),
-            os.path.join(model_dir_name, model_stem.replace('-diff', '') + ".yaml"),
-            os.path.join(global_state.script_dir, 'models', model_stem.replace('-diff', '') + ".yaml")
-        ]
-
-        override_config = possible_config_filenames[0]
-
-        for possible_config_filename in possible_config_filenames:
-            if os.path.exists(possible_config_filename):
-                override_config = possible_config_filename
-                break
-
-        if 'v11' in model_stem.lower() or 'shuffle' in model_stem.lower():
-            assert os.path.exists(override_config), f'Error: The model config {override_config} is missing. ControlNet 1.1 must have configs.'
-
-        if os.path.exists(override_config):
-            network_config = override_config
-        else:
-            # Note: This error is triggered in unittest, but not caught.
-            # TODO: Replace `print` with `logger.error`.
-            print(f'ERROR: ControlNet cannot find model config [{override_config}] \n'
-                  f'ERROR: ControlNet will use a WRONG config [{network_config}] to load your model. \n'
-                  f'ERROR: The WRONG config may not match your model. The generated results can be bad. \n'
-                  f'ERROR: You are using a ControlNet model [{model_stem}] without correct YAML config file. \n'
-                  f'ERROR: The performance of this model may be worse than your expectation. \n'
-                  f'ERROR: If this model cannot get good results, the reason is that you do not have a YAML file for the model. \n'
-                  f'Solution: Please download YAML file, or ask your model provider to provide [{override_config}] for you to download.\n'
-                  f'Hint: You can take a look at [{os.path.join(global_state.script_dir, "models")}] to find many existing YAML files.\n')
-
-        logger.info(f"Loading config: {network_config}")
-        network = network_module(
-            state_dict=state_dict,
-            config_path=network_config,
-            lowvram=lowvram,
-            base_model=unet,
-        )
-        network.to(p.sd_model.device, dtype=p.sd_model.dtype)
+        network = build_model_by_guess(state_dict, unet, model_path)
+        network.to('cpu', dtype=p.sd_model.dtype)
         logger.info(f"ControlNet model {model} loaded.")
         return network
 
@@ -477,41 +433,44 @@ class Script(scripts.Script, metaclass=(
                 inpaint_mask = x[:, :, 3]
                 x = x[:, :, 0:3]
 
-            new_size_is_smaller = (size[0] * size[1]) < (x.shape[0] * x.shape[1])
-            new_size_is_bigger = (size[0] * size[1]) > (x.shape[0] * x.shape[1])
-            unique_color_count = len(get_unique_axis0(x.reshape(-1, x.shape[2])))
-            is_one_pixel_edge = False
-            is_binary = False
-            if unique_color_count == 2:
-                is_binary = np.min(x) < 16 and np.max(x) > 240
-                if is_binary:
-                    xc = x
-                    xc = cv2.erode(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
-                    xc = cv2.dilate(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
-                    one_pixel_edge_count = np.where(xc < x)[0].shape[0]
-                    all_edge_count = np.where(x > 127)[0].shape[0]
-                    is_one_pixel_edge = one_pixel_edge_count * 2 > all_edge_count
+            if x.shape[0] != size[1] or x.shape[1] != size[0]:
+                new_size_is_smaller = (size[0] * size[1]) < (x.shape[0] * x.shape[1])
+                new_size_is_bigger = (size[0] * size[1]) > (x.shape[0] * x.shape[1])
+                unique_color_count = len(get_unique_axis0(x.reshape(-1, x.shape[2])))
+                is_one_pixel_edge = False
+                is_binary = False
+                if unique_color_count == 2:
+                    is_binary = np.min(x) < 16 and np.max(x) > 240
+                    if is_binary:
+                        xc = x
+                        xc = cv2.erode(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
+                        xc = cv2.dilate(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
+                        one_pixel_edge_count = np.where(xc < x)[0].shape[0]
+                        all_edge_count = np.where(x > 127)[0].shape[0]
+                        is_one_pixel_edge = one_pixel_edge_count * 2 > all_edge_count
 
-            if 2 < unique_color_count < 200:
-                interpolation = cv2.INTER_NEAREST
-            elif new_size_is_smaller:
-                interpolation = cv2.INTER_AREA
-            else:
-                interpolation = cv2.INTER_CUBIC  # Must be CUBIC because we now use nms. NEVER CHANGE THIS
-
-            y = cv2.resize(x, size, interpolation=interpolation)
-            if inpaint_mask is not None:
-                inpaint_mask = cv2.resize(inpaint_mask, size, interpolation=interpolation)
-
-            if is_binary:
-                y = np.mean(y.astype(np.float32), axis=2).clip(0, 255).astype(np.uint8)
-                if is_one_pixel_edge:
-                    y = nake_nms(y)
-                    _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    y = lvmin_thin(y, prunings=new_size_is_bigger)
+                if 2 < unique_color_count < 200:
+                    interpolation = cv2.INTER_NEAREST
+                elif new_size_is_smaller:
+                    interpolation = cv2.INTER_AREA
                 else:
-                    _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                y = np.stack([y] * 3, axis=2)
+                    interpolation = cv2.INTER_CUBIC  # Must be CUBIC because we now use nms. NEVER CHANGE THIS
+
+                y = cv2.resize(x, size, interpolation=interpolation)
+                if inpaint_mask is not None:
+                    inpaint_mask = cv2.resize(inpaint_mask, size, interpolation=interpolation)
+
+                if is_binary:
+                    y = np.mean(y.astype(np.float32), axis=2).clip(0, 255).astype(np.uint8)
+                    if is_one_pixel_edge:
+                        y = nake_nms(y)
+                        _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        y = lvmin_thin(y, prunings=new_size_is_bigger)
+                    else:
+                        _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    y = np.stack([y] * 3, axis=2)
+            else:
+                y = x
 
             if inpaint_mask is not None:
                 inpaint_mask = (inpaint_mask > 127).astype(np.float32) * 255.0
@@ -562,39 +521,19 @@ class Script(scripts.Script, metaclass=(
     @staticmethod
     def get_enabled_units(p):
         units = external_code.get_all_units_in_processing(p)
-        enabled_units = []
-
         if len(units) == 0:
             # fill a null group
             remote_unit = Script.parse_remote_call(p, Script.get_default_ui_unit(), 0)
             if remote_unit.enabled:
                 units.append(remote_unit)
-
-        for idx, unit in enumerate(units):
-            unit = Script.parse_remote_call(p, unit, idx)
-            if not unit.enabled:
-                continue
-
-            enabled_units.append(copy(unit))
-            if len(units) != 1:
-                log_key = f"ControlNet {idx}"
-            else:
-                log_key = "ControlNet"
-
-            log_value = {
-                "preprocessor": unit.module,
-                "model": unit.model,
-                "weight": unit.weight,
-                "starting/ending": str((unit.guidance_start, unit.guidance_end)),
-                "resize mode": str(unit.resize_mode),
-                "pixel perfect": str(unit.pixel_perfect),
-                "control mode": str(unit.control_mode),
-                "preprocessor params": str((unit.processor_res, unit.threshold_a, unit.threshold_b)),
-            }
-            log_value = str(log_value).replace('\'', '').replace('{', '').replace('}', '')
-
-            p.extra_generation_params.update({log_key: log_value})
-
+        
+        enabled_units = [
+            copy(local_unit)
+            for idx, unit in enumerate(units)
+            for local_unit in (Script.parse_remote_call(p, unit, idx),)
+            if local_unit.enabled
+        ]
+        Infotext.write_infotext(enabled_units, p)
         return enabled_units
 
     @staticmethod
@@ -698,20 +637,19 @@ class Script(scripts.Script, metaclass=(
                 setattr(unit, param, default_value)
                 logger.warning(f'[{unit.module}.{param}] Invalid value({value}), using default value {default_value}.')
 
-    def process(self, p, *args):
-        """
-        This function is called before processing begins for AlwaysVisible scripts.
-        You can modify the processing object (p) here, inject hooks, etc.
-        args contains all values returned by components from ui()
-        """
+    def controlnet_main_entry(self, p):
         sd_ldm = p.sd_model
         unet = sd_ldm.model.diffusion_model
+        self.noise_modifier = None
 
-        setattr(p, 'controlnet_initial_noise_modifier', None)
+        setattr(p, 'controlnet_control_loras', [])
 
         if self.latest_network is not None:
             # always restore (~0.05s)
-            self.latest_network.restore(unet)
+            self.latest_network.restore()
+
+        # always clear (~0.05s)
+        clear_all_secondary_control_models()
 
         if not batch_hijack.instance.is_batch:
             self.enabled_units = Script.get_enabled_units(p)
@@ -719,11 +657,6 @@ class Script(scripts.Script, metaclass=(
         if len(self.enabled_units) == 0:
            self.latest_network = None
            return
-        
-        is_sdxl = getattr(p.sd_model, 'is_sdxl', False)
-        if is_sdxl:
-            logger.warning('ControlNet does not support SDXL -- disabling')
-            return
 
         detected_maps = []
         forward_params = []
@@ -732,6 +665,9 @@ class Script(scripts.Script, metaclass=(
         # cache stuff
         if self.latest_model_hash != p.sd_model.sd_model_hash:
             Script.clear_control_model_cache()
+
+        for idx, unit in enumerate(self.enabled_units):
+            unit.module = global_state.get_module_basename(unit.module)
 
         # unload unused preproc
         module_list = [unit.module for unit in self.enabled_units]
@@ -743,15 +679,19 @@ class Script(scripts.Script, metaclass=(
         for idx, unit in enumerate(self.enabled_units):
             Script.bound_check_params(unit)
 
-            unit.module = global_state.get_module_basename(unit.module)
             resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
             control_mode = external_code.control_mode_from_value(unit.control_mode)
 
             if unit.module in model_free_preprocessors:
                 model_net = None
             else:
-                model_net = Script.load_control_model(p, unet, unit.model, unit.low_vram)
+                model_net = Script.load_control_model(p, unet, unit.model)
                 model_net.reset()
+
+                if getattr(model_net, 'is_control_lora', False):
+                    control_lora = model_net.control_model
+                    bind_control_lora(unet, control_lora)
+                    p.controlnet_control_loras.append(control_lora)
 
             input_image, image_from_a1111 = Script.choose_input_image(p, unit, idx)
             if image_from_a1111:
@@ -829,6 +769,25 @@ class Script(scripts.Script, metaclass=(
                 # inpaint_only+lama is special and required outpaint fix
                 _, input_image = Script.detectmap_proc(input_image, unit.module, resize_mode, hr_y, hr_x)
 
+            control_model_type = ControlModelType.ControlNet
+            global_average_pooling = False
+
+            if 'reference' in unit.module:
+                control_model_type = ControlModelType.AttentionInjection
+            elif 'revision' in unit.module:
+                control_model_type = ControlModelType.ReVision
+            elif hasattr(model_net, 'control_model') and (isinstance(model_net.control_model, Adapter) or isinstance(model_net.control_model, Adapter_light)):
+                control_model_type = ControlModelType.T2I_Adapter
+            elif hasattr(model_net, 'control_model') and isinstance(model_net.control_model, StyleAdapter):
+                control_model_type = ControlModelType.T2I_StyleAdapter
+            elif isinstance(model_net, PlugableIPAdapter):
+                control_model_type = ControlModelType.IPAdapter
+            elif isinstance(model_net, PlugableControlLLLite):
+                control_model_type = ControlModelType.Controlllite
+
+            if control_model_type is ControlModelType.ControlNet:
+                global_average_pooling = model_net.control_model.global_average_pooling
+
             preprocessor_resolution = unit.processor_res
             if unit.pixel_perfect:
                 preprocessor_resolution = external_code.pixel_perfect_resolution(
@@ -853,12 +812,6 @@ class Script(scripts.Script, metaclass=(
                 thr_b=unit.threshold_b,
             )
 
-            if unit.module == "none" and "style" in unit.model:
-                detected_map_bytes = detected_map[:,:,0].tobytes()
-                detected_map = np.ndarray((round(input_image.shape[0]/4),input_image.shape[1]),dtype="float32",buffer=detected_map_bytes)
-                detected_map = torch.Tensor(detected_map).to(devices.get_device_for("controlnet"))
-                is_image = False
-
             if high_res_fix:
                 if is_image:
                     hr_control, hr_detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, hr_y, hr_x)
@@ -873,25 +826,13 @@ class Script(scripts.Script, metaclass=(
                 detected_maps.append((detected_map, unit.module))
             else:
                 control = detected_map
-                if unit.module == 'clip_vision':
-                    detected_maps.append((processor.clip_vision_visualization(detected_map), unit.module))
+                detected_maps.append((input_image, unit.module))
 
-            control_model_type = ControlModelType.ControlNet
+            if control_model_type == ControlModelType.T2I_StyleAdapter:
+                control = control['last_hidden_state']
 
-            if isinstance(model_net, PlugableAdapter):
-                control_model_type = ControlModelType.T2I_Adapter
-
-            if getattr(model_net, "target", None) == "scripts.adapter.StyleAdapter":
-                control_model_type = ControlModelType.T2I_StyleAdapter
-
-            if 'reference' in unit.module:
-                control_model_type = ControlModelType.AttentionInjection
-
-            global_average_pooling = False
-
-            if model_net is not None:
-                if model_net.config.model.params.get("global_average_pooling", False):
-                    global_average_pooling = True
+            if control_model_type == ControlModelType.ReVision:
+                control = control['image_embeds']
 
             preprocessor_dict = dict(
                 name=unit.module,
@@ -943,15 +884,108 @@ class Script(scripts.Script, metaclass=(
 
                 post_processors.append(inpaint_only_post_processing)
 
+            if 'recolor' in unit.module:
+                final_feed = hr_control if hr_control is not None else control
+                final_feed = final_feed.detach().cpu().numpy()
+                final_feed = np.ascontiguousarray(final_feed).copy()
+                final_feed = final_feed[0, 0, :, :].astype(np.float32)
+                final_feed = (final_feed * 255).clip(0, 255).astype(np.uint8)
+                Hfeed, Wfeed = final_feed.shape
+
+                if 'luminance' in unit.module:
+
+                    def recolor_luminance_post_processing(x):
+                        C, H, W = x.shape
+                        if Hfeed != H or Wfeed != W or C != 3:
+                            logger.error('Error: ControlNet find post-processing resolution mismatch. This could be related to other extensions hacked processing.')
+                            return x
+                        h = x.detach().cpu().numpy().transpose((1, 2, 0))
+                        h = (h * 255).clip(0, 255).astype(np.uint8)
+                        h = cv2.cvtColor(h, cv2.COLOR_RGB2LAB)
+                        h[:, :, 0] = final_feed
+                        h = cv2.cvtColor(h, cv2.COLOR_LAB2RGB)
+                        h = (h.astype(np.float32) / 255.0).transpose((2, 0, 1))
+                        y = torch.from_numpy(h).clip(0, 1).to(x)
+                        return y
+
+                    post_processors.append(recolor_luminance_post_processing)
+
+                if 'intensity' in unit.module:
+
+                    def recolor_intensity_post_processing(x):
+                        C, H, W = x.shape
+                        if Hfeed != H or Wfeed != W or C != 3:
+                            logger.error('Error: ControlNet find post-processing resolution mismatch. This could be related to other extensions hacked processing.')
+                            return x
+                        h = x.detach().cpu().numpy().transpose((1, 2, 0))
+                        h = (h * 255).clip(0, 255).astype(np.uint8)
+                        h = cv2.cvtColor(h, cv2.COLOR_RGB2HSV)
+                        h[:, :, 2] = final_feed
+                        h = cv2.cvtColor(h, cv2.COLOR_HSV2RGB)
+                        h = (h.astype(np.float32) / 255.0).transpose((2, 0, 1))
+                        y = torch.from_numpy(h).clip(0, 1).to(x)
+                        return y
+
+                    post_processors.append(recolor_intensity_post_processing)
+
             if '+lama' in unit.module:
                 forward_param.used_hint_cond_latent = hook.UnetHook.call_vae_using_process(p, control)
-                setattr(p, 'controlnet_initial_noise_modifier', forward_param.used_hint_cond_latent)
+                self.noise_modifier = forward_param.used_hint_cond_latent
+
             del model_net
 
-        self.latest_network = UnetHook(lowvram=any(unit.low_vram for unit in self.enabled_units))
+        is_low_vram = any(unit.low_vram for unit in self.enabled_units)
+
+        self.latest_network = UnetHook(lowvram=is_low_vram)
         self.latest_network.hook(model=unet, sd_ldm=sd_ldm, control_params=forward_params, process=p)
+
+        for param in forward_params:
+            if param.control_model_type == ControlModelType.IPAdapter:
+                param.control_model.hook(
+                    model=unet,
+                    clip_vision_output=param.hint_cond,
+                    weight=param.weight,
+                    dtype=torch.float32,
+                    start=param.start_guidance_percent,
+                    end=param.stop_guidance_percent
+                )
+            if param.control_model_type == ControlModelType.Controlllite:
+                param.control_model.hook(
+                    model=unet,
+                    cond=param.hint_cond,
+                    weight=param.weight,
+                    start=param.start_guidance_percent,
+                    end=param.stop_guidance_percent
+                )
+
         self.detected_map = detected_maps
         self.post_processors = post_processors
+
+    def controlnet_hack(self, p):
+        t = time.time()
+        self.controlnet_main_entry(p)
+        if len(self.enabled_units) > 0:
+            logger.info(f'ControlNet Hooked - Time = {time.time() - t}')
+        return
+
+    @staticmethod
+    def process_has_sdxl_refiner(p):
+        return getattr(p, 'refiner_checkpoint', None) is not None
+
+    def process(self, p, *args, **kwargs):
+        if not Script.process_has_sdxl_refiner(p):
+            self.controlnet_hack(p)
+        return
+
+    def before_process_batch(self, p, *args, **kwargs):
+        if self.noise_modifier is not None:
+            p.rng = HackedImageRNG(rng=p.rng,
+                                   noise_modifier=self.noise_modifier,
+                                   sd_model=p.sd_model)
+        self.noise_modifier = None
+        if Script.process_has_sdxl_refiner(p):
+            self.controlnet_hack(p)
+        return
 
     def postprocess_batch(self, p, *args, **kwargs):
         images = kwargs.get('images', [])
@@ -961,8 +995,15 @@ class Script(scripts.Script, metaclass=(
         return
 
     def postprocess(self, p, processed, *args):
+        clear_all_secondary_control_models()
+
+        self.noise_modifier = None
+
+        for control_lora in getattr(p, 'controlnet_control_loras', []):
+            unbind_control_lora(control_lora)
+        p.controlnet_control_loras = []
+
         self.post_processors = []
-        setattr(p, 'controlnet_initial_noise_modifier', None)
         setattr(p, 'controlnet_vae_cache', None)
 
         processor_params_flag = (', '.join(getattr(processed, 'extra_generation_params', []))).lower()
@@ -1000,7 +1041,7 @@ class Script(scripts.Script, metaclass=(
                             ])
 
         self.input_image = None
-        self.latest_network.restore(p.sd_model.model.diffusion_model)
+        self.latest_network.restore()
         self.latest_network = None
         self.detected_map.clear()
 
@@ -1032,25 +1073,21 @@ class Script(scripts.Script, metaclass=(
         self.input_image = None
         if self.latest_network is None: return
 
-        self.latest_network.restore(shared.sd_model.model.diffusion_model)
+        self.latest_network.restore()
         self.latest_network = None
         self.detected_map.clear()
 
 
 def on_ui_settings():
     section = ('control_net', "ControlNet")
-    shared.opts.add_option("control_net_model_config", shared.OptionInfo(
-        global_state.default_conf, "Config file for Control Net models", section=section))
-    shared.opts.add_option("control_net_model_adapter_config", shared.OptionInfo(
-        global_state.default_conf_adapter, "Config file for Adapter models", section=section))
     shared.opts.add_option("control_net_detectedmap_dir", shared.OptionInfo(
         global_state.default_detectedmap_dir, "Directory for detected maps auto saving", section=section))
     shared.opts.add_option("control_net_models_path", shared.OptionInfo(
         "", "Extra path to scan for ControlNet models (e.g. training output directory)", section=section))
     shared.opts.add_option("control_net_modules_path", shared.OptionInfo(
         "", "Path to directory containing annotator model directories (requires restart, overrides corresponding command line flag)", section=section))
-    shared.opts.add_option("control_net_max_models_num", shared.OptionInfo(
-        3, "Multi ControlNet: Max models amount (requires restart)", gr.Slider, {"minimum": 1, "maximum": 10, "step": 1}, section=section))
+    shared.opts.add_option("control_net_unit_count", shared.OptionInfo(
+        3, "Multi-ControlNet: ControlNet unit number (requires restart)", gr.Slider, {"minimum": 1, "maximum": 10, "step": 1}, section=section))
     shared.opts.add_option("control_net_model_cache_size", shared.OptionInfo(
         1, "Model cache size (requires restart)", gr.Slider, {"minimum": 1, "maximum": 5, "step": 1}, section=section))
     shared.opts.add_option("control_net_inpaint_blur_sigma", shared.OptionInfo(
@@ -1064,7 +1101,7 @@ def on_ui_settings():
     shared.opts.add_option("control_net_allow_script_control", shared.OptionInfo(
         False, "Allow other script to control this extension", gr.Checkbox, {"interactive": True}, section=section))
     shared.opts.add_option("control_net_sync_field_args", shared.OptionInfo(
-        False, "Passing ControlNet parameters with \"Send to img2img\"", gr.Checkbox, {"interactive": True}, section=section))
+        True, "Paste ControlNet parameters in infotext", gr.Checkbox, {"interactive": True}, section=section))
     shared.opts.add_option("controlnet_show_batch_images_in_ui", shared.OptionInfo(
         False, "Show batch images in gradio gallery output", gr.Checkbox, {"interactive": True}, section=section))
     shared.opts.add_option("controlnet_increment_seed_during_batch", shared.OptionInfo(
@@ -1080,4 +1117,5 @@ def on_ui_settings():
 
 batch_hijack.instance.do_hijack()
 script_callbacks.on_ui_settings(on_ui_settings)
+script_callbacks.on_infotext_pasted(Infotext.on_infotext_pasted)
 script_callbacks.on_after_component(ControlNetUiGroup.on_after_component)
